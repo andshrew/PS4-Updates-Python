@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ps4_updates"
-version = "0.0.1"
+version = "1.0.0"
 authors = [
   { name="andshrew", email="7409326+andshrew@users.noreply.github.com" },
 ]
