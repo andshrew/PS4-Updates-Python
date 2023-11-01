@@ -1,0 +1,35 @@
+name: Build and Publish Package to PyPI
+
+on:
+  workflow_dispatch:
+    branches:
+      - main
+      - 'releases/**'
+
+jobs:
+  deploy:
+    name: Build Python Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.8'
+
+      - name: Upgrade pip packages
+        run: python3 -m pip install --upgrade pip build
+
+      - name: Update image URLs in README.md for PyPI
+        run: |
+          sed -i "s+](docs/images/+](https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/docs/images/+g" README.md
+
+      - name: Build package
+        run: python3 -m build
+      
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

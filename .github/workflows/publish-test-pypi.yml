@@ -1,0 +1,40 @@
+name: Build and Publish Package to TestPyPI
+
+on:
+  workflow_dispatch:
+    branches:
+      - main
+      - develop
+
+jobs:
+  deploy:
+    name: Build Python Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.8'
+
+      - name: Upgrade pip packages
+        run: python3 -m pip install --upgrade pip build
+
+      - name: Update install command for TestPyPI in README.md
+        run: |
+          sed -i "s+pip install ps4-updates+pip install -i https://test.pypi.org/simple/ ps4-updates+g" README.md
+
+      - name: Update image URLs in README.md for PyPI
+        run: |
+          sed -i "s+](docs/images/+](https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/docs/images/+g" README.md
+
+      - name: Build package
+        run: python3 -m build
+      
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository_url: https://test.pypi.org/legacy/
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}

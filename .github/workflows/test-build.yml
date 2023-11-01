@@ -1,0 +1,32 @@
+name: Test Build Package
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    branches:
+      - main
+      - develop
+
+jobs:
+  deploy:
+    name: Build Python Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.8'
+
+      - name: Upgrade pip packages
+        run: python3 -m pip install --upgrade pip build
+
+      - name: Build package
+        run: python3 -m build
