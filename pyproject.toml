@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ps4_updates"
+version = "0.0.1"
+authors = [
+  { name="andshrew", email="7409326+andshrew@users.noreply.github.com" },
+]
+description = "A simple package for accessing PS4 title update information"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.31",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[tool.hatch.build]
+exclude = [
+  ".devcontainer/",
+  ".github/",
+  "docs/",
+  ".gitignore",
+  "requirements.txt",
+  "dist/",
+  "data_dump/",
+  "app.py"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/andshrew/PS4-Updates-Python"
+"Bug Tracker" = "https://github.com/andshrew/PS4-Updates-Python/issues"
