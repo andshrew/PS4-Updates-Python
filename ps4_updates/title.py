@@ -1,6 +1,6 @@
 #   MIT License
 
-#   Copyright (c) 2023 andshrew
+#   Copyright (c) 2023, 2025 andshrew
 #   https://github.com/andshrew/PS4-Updates-Python
 
 #   Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,6 +25,7 @@ import binascii
 from datetime import datetime
 import hashlib
 import hmac
+import io
 import json
 import logging
 from pathlib import Path
@@ -32,6 +33,7 @@ import socket
 import ssl
 from urllib.parse import urlparse
 import xml.etree.ElementTree as xml
+from .pkg import *
 
 import requests
 
@@ -44,12 +46,12 @@ class Ps4TitleUpdate:
 
     Attributes:
         title_id: A PS4 Title Id like CUSA00001_00
-        download_pkg: Download and extract changeinfo from update pkg file
+        download_pkg: Download and extract param.sfo and changeinfo from update pkg file
                       Default is 'True'
         byte_limit: Download up to this many bytes of the update pkg file
     """
 
-    def __init__(self, title_id=None, download_pkg=True, byte_limit=30000000):
+    def __init__(self, title_id=None, download_pkg=True, byte_limit=50000000):
         self.title_id = title_id.replace("_00", "")
         self.title_id = self.title_id.upper()
         if len(self.title_id) != 9:
@@ -74,6 +76,8 @@ class Ps4TitleUpdate:
         self.update_pkg_url = False
         self.update_pkg_cdate = None
         self.update_pkg_cdate_as_date = None
+        self.update_pkg_param_sfo = None
+        self.update_pkg_bytes_exceeded = False
         self.changeinfo_exists = False
         self.changeinfo = None
         self.changeinfo_current = None
@@ -172,12 +176,13 @@ class Ps4TitleUpdate:
     def _get_partial_pkg_file(self, url=None, port=80, byte_limit=30000000):
         """Internal method for partially downloading an update pkg file
 
-        The pkg file for an update contains information at the beginning of the file.
-        It is not stored at a fixed location, so this method downloads up to
-        the 'byte_limit' of the file in an attempt to locate it. 
-        Currently looks for 'cdate' and 'changeinfo.xml'
+        The PKG file for an update contains additional information relating to update.
+        This method parses the PKG header and file table, and then will download data
+        up to the location of the files of interest.
+        Currently looks for 'param.sfo' and 'changeinfo.xml'
         """
 
+        self.update_pkg_bytes_exceeded = False
         if url is None:
             url = self.update_pkg_url
         url_parsed = urlparse(url)
@@ -204,96 +209,212 @@ class Ps4TitleUpdate:
         s.send(request.encode())
 
         # Build up the pkg file in the response variable
-        # TODO
-        # Consider discarding the start of 'response' while searching so that
-        # data we don't care about isn't held in memory.
-        # There is likely a better way to do this
         response = b''
+        bytes_rcvd = 0
 
-        changeinfo_start = '<changeinfo>'.encode()  # LF
-        changeinfo_end = '</changeinfo>'.encode()
-        changeinfo_start_idx = -1
-        changeinfo_end_idx = -1
         changeinfo_found = False
         changeinfo = None
 
         cdate_found = False
-        cdate_start = 'c_date='.encode()
-        cdate_start_idx = -1
-        cdate_end_idx = -1
         cdate = None
 
-        # Download the pkg file until either the information we want is found, or the byte_limit is reached
+        pkg = None
+        pkg_magic = b'\x7fCNT'
+        sfo = None
+
+        # Locate the PKG file in the downloaded data
         while True:
             chunk = s.recv(4096)
+            bytes_rcvd += len(chunk)
             if len(chunk) == 0:
                 # No more data
-                logger.debug(f'changeinfo.xml NOT found - server has no more bytes to send - actual bytes downloaded {len(response)}')
+                logger.error(f'PKG file header NOT found - server has no more bytes to send - actual data downloaded {bytes_to_formatted_filesize(bytes_rcvd)}')
+                response = None
                 break
             response = response + chunk
-            # Find 'cdate' - Creation Date
-            if cdate_found is False:
-                cdate_start_idx = response.find(cdate_start)
-            if cdate_start_idx >= 0 and cdate_found is False:
-                cdate_end_idx = response.find(','.encode(), cdate_start_idx, cdate_start_idx + 16)
-                if cdate_end_idx != -1:
-                    logger.debug(f'cdate found at {len(response)}')
-                    cdate_found = True
-                    cdate = response[cdate_start_idx+7:cdate_end_idx].decode()
-            # Find 'changeinfo.xml' - Patch Update Notes
-            if changeinfo_start_idx == -1:
-                changeinfo_start_idx = response.find(changeinfo_start)
-            if changeinfo_start_idx >= 0 and changeinfo_found is False:
-                changeinfo_end_idx = response.find(changeinfo_end, changeinfo_start_idx)
-            if changeinfo_end_idx >= 0 and changeinfo_found is False:
-                logger.debug(f'changeinfo.xml found at {len(response)}')
-                changeinfo_found = True
-                changeinfo = response[changeinfo_start_idx:changeinfo_end_idx + len(changeinfo_end)].decode()
-            # Stop downloading if we have found all required information
-            if cdate_found == changeinfo_found == True:
-                logger.debug(f'cdate and changeinfo.xml found - exit download early at {len(response)}')
+
+            if pkg_magic not in response:
+                # Sometimes downloads are redirected to specific CDN URL
+                if "302 Moved Temporarily" in response[0:100].decode():
+                    logger.debug(f'302 Moved Temporarily')
+                    response_headers = response.decode().splitlines()
+                    for i, c in enumerate(response_headers):
+                        if "Location: " in c:
+                            redirect_url = urlparse(response_headers[i].replace("Location: ", ""))
+                            logger.debug(f'Trying again with URL: {redirect_url.geturl()}')
+                            # Call this method again to try and download using the CDN URL
+                            return self._get_partial_pkg_file(url=redirect_url.geturl(), byte_limit=byte_limit)
+            if pkg_magic in response:
                 break
-            # Stop downloading if we have reached the byte download limit
-            if len(response) >= byte_limit:
-                logger.debug(f'changeinfo.xml NOT found - exit download at byte download limit {byte_limit} - actual bytes downloaded {len(response)}')
+            if bytes_rcvd >= byte_limit:
+                logger.error(f'PKG file header NOT found - byte limit {byte_limit} reached - actual bytes downloaded {bytes_rcvd}')
+                response = None
                 break
+
+        # The PKG file has been found in the response
+        if pkg_magic in response:            
+            # Discard the initial part of the response, so that response now starts with the PKG file
+            offset = response.find(pkg_magic)
+            response = response[offset:]
+            pkg = PKG(offset = 0)
+
+            # Parse the PKG header
+            with io.BytesIO(response) as b:
+                pkg.set_from_bytes(b)
+
+            # Continue downloading data up to the end of the PKG files table
+            pkg_table_end = pkg.table_offset + (pkg.file_count * 32)
+            while pkg_table_end > len(response):
+                # Need more bytes
+                chunk = s.recv(4096)
+                bytes_rcvd += len(chunk)
+                if len(chunk) == 0:
+                    # No more data
+                    logger.debug(f'No more data')
+                    break
+                response = response + chunk
+            
+            # Parse the PKG files table
+            with io.BytesIO(response) as b:
+                b.seek(pkg.table_offset)
+                for i in range(pkg.file_count):
+                    file = PKG_File()
+                    file.unpack_from_bytes(b)
+                    pkg.files.append(file)
+
+            # We can now locate files of interest, namely:
+            # id    | File
+            # ==    | ====
+            # 4096  | param.sfo (various PKG metadata including cdate)
+            # 4704  | changeinfo.xml (Developer patch notes)
+
+            # Check that downloading the param.sfo and changeinfo.xml won't result in exceeding the byte_limit
+            check_end_location = 0
+            check = file = next((x for x in pkg.files if x.id == 4704), None)
+            if check is not None:
+                if check.offset + check.size > check_end_location:
+                    check_end_location = check.offset + check.size
+            check = file = next((x for x in pkg.files if x.id == 4096), None)
+            if check is not None:
+                if check.offset + check.size > check_end_location:
+                    check_end_location = check.offset + check.size
+            if check_end_location == 0:
+                logging.info(f'Neither changeinfo.xml or param.sfo are in this PKG file')
+                s.close()
+                return
+            if check_end_location + bytes_rcvd >= byte_limit:
+                logger.error(f'changeinfo.xml or param.sfo are located beyond the current byte limit {byte_limit}. ' + \
+                             f'Increase {byte_limit} to at least {check_end_location + bytes_rcvd + 1} ' + \
+                             f'to download')
+                logger.debug(f'In total {bytes_to_formatted_filesize(bytes_rcvd)} of the PKG file was downloaded')
+                self.update_pkg_bytes_exceeded = True
+                s.close()
+                return
+
+            # Locate and parse changeinfo.xml
+            file = next((x for x in pkg.files if x.id == 4704), None)
+            if file is None:
+                logger.debug(f'changeinfo.xml does not exist within the PKG file table')
+            if file is not None:
+                logger.debug(f'changeinfo.xml is located at offset {file.offset}')
+                changeinfo_end = file.offset + file.size
+                while changeinfo_end > len(response):
+                    # Continue downloading up to the end of the changeinfo.xml files location
+                    chunk = s.recv(16384)
+                    bytes_rcvd += len(chunk)
+                    if len(chunk) == 0:
+                        logger.error(f'The server has no more data to transfer, but the end of the changeinfo.xml file has not been received yet')
+                        s.close()
+                        return
+                    response = response + chunk
+                try:
+                    changeinfo = response[file.offset:changeinfo_end].decode()
+                except Exception as ex:
+                    logger.error(f'Unable to decode the changeinfo.xml file from the response data: {ex.args}')
+                    changeinfo = None
+
+                self.update_pkg_exists = True
+                if changeinfo is not None:
+                    changeinfo_found = True
+                    self.changeinfo_xml = changeinfo
+                    self.changeinfo_exists = True
+                    self.changeinfo = self._parse_changeinfo_xml(self.changeinfo_xml)
+                    # When changeinfo.xml contains update notes for multiple versions, there is
+                    # no guarantee on the order. Some developers have theirs ascending, some descending.
+                    # Try to sort the list so that the first entry is for the latest version
+                    self.changeinfo = sorted(self.changeinfo, key=lambda x: x['app_version'], reverse=True)
+                    # There is no guarantee that there are notes for the current version.
+                    # Try and find that if it exists.
+                    current_change = list(filter(lambda x: x['app_version'] == self.version, self.changeinfo))
+                    if len(current_change) > 0:
+                        self.changeinfo_current = current_change
+                        self.changeinfo_current_exists = True
+            
+            # Locate and parse param.sfo
+            file = next((x for x in pkg.files if x.id == 4096), None)
+            if file is None:
+                logger.debug(f'param.sfo does not exist within the PKG file table')
+            if file is not None:
+                logger.debug(f'param.sfo is located at offset {file.offset}')
+                sfo_end = file.offset + file.size
+                while sfo_end > len(response):
+                    # Continue downloading up to the end of the param.sfo files location
+                    chunk = s.recv(16384)
+                    bytes_rcvd += len(chunk)
+                    if len(chunk) == 0:
+                        logger.error(f'The server has no more data to transfer, but the end of the param.sfo file has not been received yet')
+                        s.close()
+                        return
+                    response = response + chunk
+                sfo_data = response[file.offset:sfo_end]
+                sfo = SFO(offset_relative=file.offset)
+                with io.BytesIO(sfo_data) as b:
+                    sfo.set_from_bytes(b)
+                    b.seek(20)
+                    # Parse the entry index
+                    for i in range(sfo.number_of_entries):
+                        entry = SFO_Entry()
+                        entry.set_from_bytes(b)
+                        sfo.entries.append(entry)
+                    sfo.set_entries_name(b)
+                    # Parse the entry data
+                    for i in range(sfo.number_of_entries):
+                        entry = sfo.entries[i]
+                        b.seek(sfo.data_table_offset + entry.data_table_offset)
+                        entry.data_bytes = b.read(entry.param_length)
+                self.update_pkg_param_sfo = sfo
+                self.update_pkg_exists = True
+                # The cdate is within param.sfo entry "PUBTOOLINFO"
+                # This is a comma seperated NULL terminated string of
+                # key pair values
+                pub_data = next((x for x in sfo.entries if x.name == "PUBTOOLINFO"), None)
+                if pub_data is None:
+                    logger.debug(f'PUBTOOLINFO does not exist within the param.sfo entries')
+                if pub_data is not None:
+                    try:
+                        data = pub_data.data_bytes.decode()
+                    except Exception as ex:
+                        logger.error(f'Unable to decode PUBTOOLINFO data: {ex.args}')
+                        data = None
+
+                    if data is not None:
+                        data = data.split(',')
+                        cdate = next((x for x in data if "c_date" in x), None)
+                        if cdate is not None:
+                            cdate = cdate[7:]
+                            cdate_found = True
+                            self.update_pkg_exists = True
+                            self.update_pkg_cdate = cdate
+                            try:
+                                self.update_pkg_cdate_as_date = datetime.strptime(self.update_pkg_cdate, '%Y%m%d')
+                            except Exception as ex:
+                                logger.error(f'Unable to parse cdate into datetime: {self.update_pkg_cdate}')
+                                self.update_pkg_cdate = None
         s.close()
 
-        # Sometimes downloads are redirected to specific CDN URL
-        if "302 Moved Temporarily" in response[0:100].decode():
-            logger.debug(f'302 Moved Temporarily')
-            response_headers = response.decode().splitlines()
-            for i, c in enumerate(response_headers):
-                if "Location: " in c:
-                    redirect_url = urlparse(response_headers[i].replace("Location: ", ""))
-                    logger.debug(f'Trying again with URL: {redirect_url.geturl()}')
-                    # Call this method again to try and download using the CDN URL
-                    return self._get_partial_pkg_file(url=redirect_url.geturl(), byte_limit=byte_limit)
-
-        if cdate_found is True:
-            self.update_pkg_exists = True
-            self.update_pkg_cdate = cdate
-            try:
-                self.update_pkg_cdate_as_date = datetime.strptime(self.update_pkg_cdate, '%Y%m%d')
-            except Exception as ex:
-                logger.error(f'Unable to parse cdate into datetime: {self.update_pkg_cdate}')
-                self.update_pkg_cdate = None
-
-        if changeinfo_found is True:
-            self.update_pkg_exists = True
-            self.changeinfo_xml = changeinfo
-            self.changeinfo_exists = True
-            self.changeinfo = self._parse_changeinfo_xml(self.changeinfo_xml)
-            # When changeinfo.xml contains update notes for multiple versions, there is
-            # no guarantee on the order. Some developers have theirs ascending, some descending.
-            # Try to sort the list so that the first entry is for the latest version
-            self.changeinfo = sorted(self.changeinfo, key=lambda x: x['app_version'], reverse=True)
-            # There is no guarantee that there are notes for the current version.
-            # Try and find that if it exists.
-            current_change = list(filter(lambda x: x['app_version'] == self.version, self.changeinfo))
-            if len(current_change) > 0:
-                self.changeinfo_current = current_change
-                self.changeinfo_current_exists = True
+        if cdate_found == changeinfo_found == True:
+            logger.debug(f'cdate and changeinfo.xml were found')
+        logger.debug(f'In total {bytes_to_formatted_filesize(bytes_rcvd)} of the PKG file was downloaded')
 
         return
 
